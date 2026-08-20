@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { createClient } from "@supabase/supabase-js";
 import {
   ArrowLeft,
   Check,
@@ -24,6 +25,7 @@ type Photo = {
   name: string;
   dataUrl: string;
   isCover?: boolean;
+  file?: File;
 };
 
 type Album = {
@@ -48,6 +50,10 @@ type View =
 
 const STORAGE_KEY = "frametap/albums";
 const BASE_PATH = import.meta.env.BASE_URL;
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
+const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY ?? import.meta.env.VITE_SUPABASE_ANON_KEY;
+const SUPABASE_BUCKET = import.meta.env.VITE_SUPABASE_STORAGE_BUCKET ?? "album-photos";
+const supabase = SUPABASE_URL && SUPABASE_KEY ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
 const SAMPLE_PHOTOS: Photo[] = [
   {
     id: "sample-1",
@@ -117,6 +123,145 @@ function readAlbums(): Album[] {
   }
 }
 
+function serializeAlbum(album: Album): Album {
+  return {
+    ...album,
+    photos: album.photos.map(({ file: _file, ...photo }) => photo),
+  };
+}
+
+function rowToAlbum(row: AlbumRow): Album {
+  return {
+    id: row.id,
+    slug: row.slug,
+    title: row.title,
+    destination: row.destination,
+    dates: row.dates,
+    description: row.description ?? "",
+    story: row.story ?? "",
+    favoriteMemory: row.favorite_memory ?? "",
+    people: row.people ?? "",
+    photos: row.photos ?? [],
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function albumToRow(album: Album, ownerId: string) {
+  return {
+    id: album.id,
+    owner_id: ownerId,
+    slug: album.slug,
+    title: album.title,
+    destination: album.destination,
+    dates: album.dates,
+    description: album.description,
+    story: album.story,
+    favorite_memory: album.favoriteMemory,
+    people: album.people,
+    photos: serializeAlbum(album).photos,
+    is_public: true,
+    updated_at: album.updatedAt,
+  };
+}
+
+type AlbumRow = {
+  id: string;
+  slug: string;
+  title: string;
+  destination: string;
+  dates: string;
+  description: string | null;
+  story: string | null;
+  favorite_memory: string | null;
+  people: string | null;
+  photos: Photo[];
+  created_at: string;
+  updated_at: string;
+};
+
+async function ensureAnonymousSession() {
+  if (!supabase) return "";
+  const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+  if (sessionError) throw sessionError;
+  if (sessionData.session) return sessionData.session.user.id;
+
+  const { data, error } = await supabase.auth.signInAnonymously();
+  if (error) throw error;
+  return data.user?.id ?? "";
+}
+
+async function fetchRemoteAlbums() {
+  if (!supabase) return null;
+  const userId = await ensureAnonymousSession();
+  const { data, error } = await supabase
+    .from("albums")
+    .select("id, slug, title, destination, dates, description, story, favorite_memory, people, photos, created_at, updated_at")
+    .eq("owner_id", userId)
+    .order("updated_at", { ascending: false });
+
+  if (error) throw error;
+  return data.map(rowToAlbum);
+}
+
+async function fetchRemoteAlbumBySlug(slug: string) {
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from("albums")
+    .select("id, slug, title, destination, dates, description, story, favorite_memory, people, photos, created_at, updated_at")
+    .eq("slug", slug)
+    .eq("is_public", true)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data ? rowToAlbum(data) : null;
+}
+
+async function uploadPendingPhotos(album: Album) {
+  if (!supabase) return serializeAlbum(album);
+  const userId = await ensureAnonymousSession();
+
+  const photos = await Promise.all(
+    album.photos.map(async (photo) => {
+      if (!photo.file) return photo;
+      const safeName = photo.name.toLowerCase().replace(/[^a-z0-9.]+/g, "-").replace(/(^-|-$)/g, "");
+      const path = `${userId}/${album.id}/${photo.id}-${safeName || "photo.jpg"}`;
+      const { error } = await supabase.storage.from(SUPABASE_BUCKET).upload(path, photo.file, {
+        cacheControl: "31536000",
+        contentType: photo.file.type,
+        upsert: true,
+      });
+
+      if (error) throw error;
+      const { data } = supabase.storage.from(SUPABASE_BUCKET).getPublicUrl(path);
+      return {
+        id: photo.id,
+        name: photo.name,
+        dataUrl: data.publicUrl,
+        isCover: photo.isCover,
+      };
+    }),
+  );
+
+  return serializeAlbum({ ...album, photos });
+}
+
+async function saveRemoteAlbum(album: Album) {
+  if (!supabase) return album;
+  const userId = await ensureAnonymousSession();
+  const uploadedAlbum = await uploadPendingPhotos(album);
+  const { error } = await supabase.from("albums").upsert(albumToRow(uploadedAlbum, userId), { onConflict: "id" });
+  if (error) throw error;
+  return uploadedAlbum;
+}
+
+async function deleteRemoteAlbum(id: string) {
+  if (!supabase) return;
+  await ensureAnonymousSession();
+  const { error } = await supabase.from("albums").delete().eq("id", id);
+  if (error) throw error;
+}
+
 function getRoute(): View {
   const path = window.location.pathname.replace(new RegExp(`^${BASE_PATH}`), "/");
   if (path.startsWith("/album/")) return { name: "album", slug: path.split("/album/")[1] };
@@ -148,6 +293,8 @@ function coverOf(album: Album) {
 function App() {
   const [route, setRoute] = useState<View>(getRoute);
   const [albums, setAlbums] = useState<Album[]>(readAlbums);
+  const [isLoading, setIsLoading] = useState(Boolean(supabase));
+  const [syncStatus, setSyncStatus] = useState(supabase ? "Connecting to cloud storage..." : "Local preview mode");
 
   useEffect(() => {
     const onRoute = () => setRoute(getRoute());
@@ -156,18 +303,64 @@ function App() {
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(albums));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(albums.map(serializeAlbum)));
   }, [albums]);
 
-  const saveAlbum = (album: Album) => {
+  useEffect(() => {
+    let active = true;
+
+    async function loadRemoteAlbums() {
+      if (!supabase) return;
+      try {
+        const remoteAlbums = await fetchRemoteAlbums();
+        if (!active || !remoteAlbums) return;
+        setAlbums(remoteAlbums.length ? remoteAlbums : []);
+        setSyncStatus("Cloud storage connected");
+      } catch (error) {
+        console.error(error);
+        if (active) setSyncStatus("Cloud storage unavailable. Using this browser only.");
+      } finally {
+        if (active) setIsLoading(false);
+      }
+    }
+
+    loadRemoteAlbums();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (route.name !== "album" || albums.some((album) => album.slug === route.slug)) return;
+    let active = true;
+
+    async function loadPublicAlbum() {
+      try {
+        const album = await fetchRemoteAlbumBySlug(route.name === "album" ? route.slug : "");
+        if (!active || !album) return;
+        setAlbums((current) => [album, ...current.filter((item) => item.id !== album.id)]);
+      } catch (error) {
+        console.error(error);
+      }
+    }
+
+    loadPublicAlbum();
+    return () => {
+      active = false;
+    };
+  }, [albums, route]);
+
+  const saveAlbum = async (album: Album) => {
+    const savedAlbum = await saveRemoteAlbum(album);
     setAlbums((current) => {
-      const exists = current.some((item) => item.id === album.id);
-      return exists ? current.map((item) => (item.id === album.id ? album : item)) : [album, ...current];
+      const exists = current.some((item) => item.id === savedAlbum.id);
+      return exists ? current.map((item) => (item.id === savedAlbum.id ? savedAlbum : item)) : [savedAlbum, ...current];
     });
     navigate({ name: "dashboard" });
   };
 
-  const deleteAlbum = (id: string) => {
+  const deleteAlbum = async (id: string) => {
+    await deleteRemoteAlbum(id);
     setAlbums((current) => current.filter((album) => album.id !== id));
   };
 
@@ -178,7 +371,7 @@ function App() {
     <>
       <Header route={route} />
       <main>
-        {route.name === "dashboard" && <Dashboard albums={albums} onDelete={deleteAlbum} />}
+        {route.name === "dashboard" && <Dashboard albums={albums} onDelete={deleteAlbum} isLoading={isLoading} syncStatus={syncStatus} />}
         {route.name === "editor" && <AlbumEditor existing={activeAlbum} albums={albums} onSave={saveAlbum} />}
         {route.name === "album" && <PublicAlbum album={publicAlbum} />}
       </main>
@@ -200,17 +393,24 @@ function Header({ route }: { route: View }) {
   );
 }
 
-function Dashboard({ albums, onDelete }: { albums: Album[]; onDelete: (id: string) => void }) {
+function Dashboard({ albums, onDelete, isLoading, syncStatus }: { albums: Album[]; onDelete: (id: string) => Promise<void>; isLoading: boolean; syncStatus: string }) {
   return (
     <section className="page-shell dashboard">
       <div className="page-title-row">
         <div>
           <p className="eyebrow">Dashboard</p>
           <h1>Your Albums</h1>
+          <p className="sync-status">{syncStatus}</p>
         </div>
         <button className="primary" onClick={() => navigate({ name: "editor" })}><Plus size={17} /> New album</button>
       </div>
-      {albums.length === 0 ? (
+      {isLoading ? (
+        <div className="empty-state">
+          <UploadCloud size={42} />
+          <h2>Loading albums</h2>
+          <p>Checking cloud storage for your saved trips.</p>
+        </div>
+      ) : albums.length === 0 ? (
         <EmptyState />
       ) : (
         <div className="album-grid">
@@ -221,7 +421,7 @@ function Dashboard({ albums, onDelete }: { albums: Album[]; onDelete: (id: strin
   );
 }
 
-function AlbumCard({ album, onDelete }: { album: Album; onDelete: (id: string) => void }) {
+function AlbumCard({ album, onDelete }: { album: Album; onDelete: (id: string) => Promise<void> }) {
   const [copied, setCopied] = useState(false);
   const cover = coverOf(album);
   const url = getAlbumUrl(album.slug);
@@ -245,7 +445,7 @@ function AlbumCard({ album, onDelete }: { album: Album; onDelete: (id: string) =
         <button onClick={() => navigate({ name: "album", slug: album.slug })}><ExternalLink size={16} /> View album</button>
         <button onClick={() => navigate({ name: "editor", id: album.id })}><Edit3 size={16} /> Edit</button>
         <button onClick={copyUrl}>{copied ? <Check size={16} /> : <Copy size={16} />} Copy NFC URL</button>
-        <button className="danger" onClick={() => onDelete(album.id)}><Trash2 size={16} /> Delete</button>
+        <button className="danger" onClick={() => void onDelete(album.id)}><Trash2 size={16} /> Delete</button>
       </div>
     </article>
   );
@@ -262,7 +462,7 @@ function EmptyState() {
   );
 }
 
-function AlbumEditor({ existing, albums, onSave }: { existing?: Album; albums: Album[]; onSave: (album: Album) => void }) {
+function AlbumEditor({ existing, albums, onSave }: { existing?: Album; albums: Album[]; onSave: (album: Album) => Promise<void> }) {
   const [title, setTitle] = useState(existing?.title ?? "");
   const [destination, setDestination] = useState(existing?.destination ?? "");
   const [dates, setDates] = useState(existing?.dates ?? "");
@@ -273,6 +473,7 @@ function AlbumEditor({ existing, albums, onSave }: { existing?: Album; albums: A
   const [photos, setPhotos] = useState<Photo[]>(existing?.photos ?? []);
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const fileInput = useRef<HTMLInputElement | null>(null);
 
@@ -291,7 +492,7 @@ function AlbumEditor({ existing, albums, onSave }: { existing?: Album; albums: A
         (file) =>
           new Promise<Photo>((resolve, reject) => {
             const reader = new FileReader();
-            reader.onload = () => resolve({ id: createId(), name: file.name, dataUrl: String(reader.result), isCover: photos.length === 0 });
+            reader.onload = () => resolve({ id: createId(), name: file.name, dataUrl: String(reader.result), isCover: photos.length === 0, file });
             reader.onerror = () => reject(new Error(`Could not load ${file.name}`));
             reader.readAsDataURL(file);
           }),
@@ -305,7 +506,7 @@ function AlbumEditor({ existing, albums, onSave }: { existing?: Album; albums: A
     setUploading(false);
   };
 
-  const save = () => {
+  const save = async () => {
     if (!title.trim() || !destination.trim() || !dates.trim()) {
       setError("Please complete the required trip details.");
       return;
@@ -315,20 +516,30 @@ function AlbumEditor({ existing, albums, onSave }: { existing?: Album; albums: A
       return;
     }
     const now = new Date().toISOString();
-    onSave({
-      id: existing?.id ?? createId(),
-      slug,
-      title: title.trim(),
-      destination: destination.trim(),
-      dates: dates.trim(),
-      description: description.trim(),
-      story: story.trim(),
-      favoriteMemory: favoriteMemory.trim(),
-      people: people.trim(),
-      photos,
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: now,
-    });
+    setSaving(true);
+    setError("");
+
+    try {
+      await onSave({
+        id: existing?.id ?? createId(),
+        slug,
+        title: title.trim(),
+        destination: destination.trim(),
+        dates: dates.trim(),
+        description: description.trim(),
+        story: story.trim(),
+        favoriteMemory: favoriteMemory.trim(),
+        people: people.trim(),
+        photos,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      });
+    } catch (error) {
+      console.error(error);
+      setError("Could not save the album. Check your storage settings and try again.");
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
@@ -339,7 +550,7 @@ function AlbumEditor({ existing, albums, onSave }: { existing?: Album; albums: A
           <p className="eyebrow">Album studio</p>
           <h1>{existing ? "Edit album" : "Create a travel album"}</h1>
         </div>
-        <button className="primary" onClick={save}>Save album</button>
+        <button className="primary" onClick={save} disabled={saving}>{saving ? "Saving..." : "Save album"}</button>
       </div>
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="editor-layout">

@@ -448,6 +448,12 @@ h3 {
   font-size: clamp(2.5rem, 6vw, 5.2rem);
 }
 
+.sync-status {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-weight: 720;
+}
+
 .album-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(275px, 1fr));
